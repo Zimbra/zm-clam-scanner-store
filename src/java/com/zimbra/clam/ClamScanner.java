@@ -65,7 +65,7 @@ public class ClamScanner extends UploadScanner{
             HostAndPort hostPort = HostAndPort.fromString(urlArg.substring(protocolPrefix.length()));
             hostPort.requireBracketsForIPv6();
             mClamdPort = hostPort.getPort();
-            mClamdHost = hostPort.getHostText();
+            mClamdHost = hostPort.getHost();
         } catch (IllegalArgumentException iae) {
             LOG.error("cannot parse clamd url due to illegal arg exception", iae);
             throw new MalformedURLException("cannot parse clamd url due to illegal arg exception: " + iae.getMessage());
