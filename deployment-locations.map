@@ -1,0 +1,1 @@
+build/dist/zm-clam-scanner-store*.jar => /opt/zimbra/lib/ext/clamscanner/clamscanner.jar
