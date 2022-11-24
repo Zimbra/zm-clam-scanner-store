@@ -17,35 +17,62 @@
 
 package com.zimbra.clam;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.net.HostAndPort;
+import com.zimbra.common.localconfig.LC;
+import com.zimbra.common.util.Log;
+import com.zimbra.common.util.StringUtil;
+import com.zimbra.common.util.ZimbraLog;
+import com.zimbra.cs.service.mail.UploadScanner;
+
 import java.io.BufferedOutputStream;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.MalformedURLException;
 import java.net.ProtocolException;
 import java.net.Socket;
 import java.net.UnknownHostException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.net.HostAndPort;
-import com.zimbra.common.io.TcpServerInputStream;
-import com.zimbra.common.util.ByteUtil;
-import com.zimbra.common.util.Log;
-import com.zimbra.common.util.ZimbraLog;
-import com.zimbra.cs.service.mail.UploadScanner;
+public class ClamScanner extends UploadScanner {
 
-public class ClamScanner extends UploadScanner{
+    private static final String RESULT_PREFIX = "stream: ";
+    private static final String ANSWER_OK = "OK";
+
+    private static final int SOCKET_TIMEOUT = 2000;
+    private static final int CHUNK_SIZE = 2048;
 
     private static final String DEFAULT_URL = "clam://localhost:3310/";
 
     private static final Log LOG = ZimbraLog.extensions;
-
+    private final int chunkSize;
+    private final int socketTimeout;
     private boolean mInitialized;
-
     private String mClamdHost;
-
     private int mClamdPort;
 
     public ClamScanner() {
+        socketTimeout = (LC.clamav_socket_timeout.intValue() > 0) ? LC.clamav_socket_timeout.intValue() : SOCKET_TIMEOUT;
+        chunkSize = (LC.clamav_scan_data_chunk_size.intValue() > 0) ? LC.clamav_scan_data_chunk_size.intValue() : CHUNK_SIZE;
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("socketTimeout: " + socketTimeout + ", chunkSize: " + chunkSize);
+        }
+    }
+
+    private static byte[] readAll(InputStream is) throws IOException {
+        ByteArrayOutputStream tmp = new ByteArrayOutputStream();
+
+        byte[] buf = new byte[2000];
+        int read = 0;
+        do {
+            read = is.read(buf);
+            tmp.write(buf, 0, read);
+        } while ((read > 0) && (is.available() > 0));
+        return tmp.toByteArray();
     }
 
     @Override
@@ -102,73 +129,89 @@ public class ClamScanner extends UploadScanner{
         }
     }
 
-    private static final byte[] lineSeparator = { '\r', '\n' };
-
-    private Result accept0(byte[] data, InputStream is, StringBuffer info) throws UnknownHostException, IOException {
-        Socket commandSocket = null;
-        Socket dataSocket = null;
-
+    private Result accept0(byte[] data, InputStream inputStream, StringBuffer info) throws UnknownHostException, IOException {
+        Socket socket = null;
+        OutputStream outStream = null;
+        InputStream socketInputStream = null;
         try {
-            if (LOG.isDebugEnabled()) { LOG.debug("connecting to " + mClamdHost + ":" + mClamdPort); }
-            commandSocket = new Socket(mClamdHost, mClamdPort);
-
-            BufferedOutputStream out = new BufferedOutputStream(commandSocket.getOutputStream());
-            TcpServerInputStream in = new TcpServerInputStream(commandSocket.getInputStream());
-
-            if (LOG.isDebugEnabled()) { LOG.debug("writing STREAM command"); }
-            out.write("STREAM".getBytes("iso-8859-1"));
-            out.write(lineSeparator);
-            out.flush();
-
-            if (LOG.isDebugEnabled()) { LOG.debug("reading PORT"); }
-            // REMIND - should have timeout's on this...
-            String portLine = in.readLine();
-            if (portLine == null) {
-                throw new ProtocolException("EOF from clamd when looking for PORT repsonse");
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("connecting to " + mClamdHost + ":" + mClamdPort);
             }
-            if (!portLine.startsWith("PORT ")) {
-                throw new ProtocolException("Got '" + portLine + "' from clamd, was expecting PORT <n>");
-            }
-            int port = 0;
-            try {
-                port = Integer.valueOf(portLine.substring("PORT ".length())).intValue();
-            } catch (NumberFormatException nfe) {
-                throw new ProtocolException("No port number in: " + portLine);
+            socket = new Socket(mClamdHost, mClamdPort);
+            outStream = new BufferedOutputStream(socket.getOutputStream());
+            socket.setSoTimeout(socketTimeout);
+            LOG.debug("writing zINSTREAM command");
+            outStream.write("zINSTREAM\0".getBytes(StandardCharsets.ISO_8859_1));
+            outStream.flush();
+
+            // if byte array passed as input instead of inputStream
+            if (data != null && inputStream == null) {
+                inputStream = new ByteArrayInputStream(data);
             }
 
-            if (LOG.isDebugEnabled()) { LOG.debug("stream connect to " + mClamdHost + ":" + port); }
-            dataSocket = new Socket(mClamdHost, port);
-            if (data != null) {
-                dataSocket.getOutputStream().write(data);
-                if (LOG.isDebugEnabled()) { LOG.debug("wrote " + data.length + " bytes"); }
-            } else {
-                long count = ByteUtil.copy(is, false, dataSocket.getOutputStream(), false);
-                if (LOG.isDebugEnabled()) { LOG.debug("copied " + count + " bytes"); }
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("sending data for scanning, chunkSize: " + chunkSize);
             }
-            dataSocket.close();
+            byte[] buffer = new byte[chunkSize];
+            socketInputStream = socket.getInputStream();
+            int read = inputStream.read(buffer);
+            while (read >= 0) {
+                byte[] chunkSize = ByteBuffer.allocate(4).putInt(read).array();
+                outStream.write(chunkSize);
+                outStream.write(buffer, 0, read);
+                if (socketInputStream.available() > 0) {
+                    byte[] reply = readAll(socketInputStream);
+                    throw new IOException("Reply from server: " + new String(reply, StandardCharsets.ISO_8859_1));
+                }
+                read = inputStream.read(buffer);
+            }
+            outStream.write(new byte[]{0, 0, 0, 0});
+            outStream.flush();
+            LOG.debug("reading result");
 
-            if (LOG.isDebugEnabled()) { LOG.debug("reading result"); }
-            String answer = in.readLine();
-            if (answer == null) {
+            String answer = new String(readAll(socketInputStream), StandardCharsets.ISO_8859_1);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("ClamAV response =" + answer);
+            }
+            if (StringUtil.isNullOrEmpty(answer)) {
                 throw new ProtocolException("EOF from clamd when looking for result");
             }
             info.setLength(0);
-            if (answer.startsWith("stream: ")) {
-                answer = answer.substring("stream: ".length());
+            String extractedAns = "";
+            if (answer.startsWith(RESULT_PREFIX)) {
+                extractedAns = answer.substring(RESULT_PREFIX.length()).trim();
             }
-            info.append(answer);
-            if (answer.equals("OK")) {
+
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("ClamAV extracted response: " + extractedAns);
+            }
+            info.append(extractedAns);
+            if (ANSWER_OK.equals(extractedAns)) {
                 return ACCEPT;
             } else {
                 return REJECT;
             }
         } finally {
-            if (dataSocket != null && !dataSocket.isClosed()) {
-                LOG.warn("deffered close of stream connection");
-                dataSocket.close();
+            try {
+                if (socket != null) {
+                    socket.close();
+                }
+            } catch (IOException e) {
+                LOG.debug("Exception occurred while closing socket = {} " + e.getMessage());
             }
-            if (commandSocket != null) {
-                commandSocket.close();
+            try {
+                if (socketInputStream != null) {
+                    socketInputStream.close();
+                }
+            } catch (IOException e) {
+                LOG.debug("Exception occurred while closing input streams = {} " + e.getMessage());
+            }
+            try {
+                if (outStream != null) {
+                    outStream.close();
+                }
+            } catch (IOException e) {
+                LOG.debug("Exception occurred while closing output streams = {} " + e.getMessage());
             }
         }
     }
@@ -187,6 +230,5 @@ public class ClamScanner extends UploadScanner{
     int getClamdPort() {
         return mClamdPort;
     }
-
 }
 
