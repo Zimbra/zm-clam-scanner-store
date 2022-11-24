@@ -1,4 +1,9 @@
 build/
 .project
 .classpath
-
+.DS_Store
+/bin/
+*.iml
+*.jar
+*.class
+.java-version
