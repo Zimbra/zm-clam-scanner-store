@@ -18,7 +18,6 @@
 package com.zimbra.clam;
 
 import com.zimbra.common.service.ServiceException;
-import com.zimbra.cs.account.Config;
 import com.zimbra.cs.account.Provisioning;
 import com.zimbra.cs.account.Server;
 
@@ -27,7 +26,7 @@ public class ClamScannerConfig {
     private final boolean mEnabled;
     
     private final String[] mURL;
-    
+
     public ClamScannerConfig() throws ServiceException {
         Server serverConfig = Provisioning.getInstance().getLocalServer();
         mEnabled = serverConfig.getBooleanAttr(Provisioning.A_zimbraAttachmentsScanEnabled, false);
